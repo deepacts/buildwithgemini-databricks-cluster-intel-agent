@@ -26,6 +26,7 @@ from google.adk.code_executors.agent_engine_sandbox_code_executor import (
     AgentEngineSandboxCodeExecutor,
 )
 from google.adk.models import Gemini
+from google.adk.tools import ToolContext
 from google.adk.tools.preload_memory_tool import PreloadMemoryTool
 from google.cloud import firestore
 from google.genai import types
@@ -33,6 +34,7 @@ from google.genai import types
 # Hardcoded project ID as string for Firestore Client (do NOT use project number / env vars)
 FIRESTORE_PROJECT = "qwiklabs-gcp-02-7222a271d6bd"
 FIRESTORE_COLLECTION = "databricks_clusters"
+GCS_BUCKET_NAME = "databricks-ops-optimizer-qwiklabs-gcp-02-7222a271d6bd"
 REASONING_ENGINE_RESOURCE_NAME = "projects/385105474486/locations/us-east1/reasoningEngines/4653548824143331328"
 
 
@@ -1113,6 +1115,93 @@ def get_current_time(query: str) -> str:
     return f"The current time for query {query} is {now.strftime('%Y-%m-%d %H:%M:%S %Z%z')}"
 
 
+async def generate_domain_video_preview(
+    item_description: str, tool_context: ToolContext = None
+) -> str:
+    """Generates a short video preview for an item in the Databricks domain using Google's Omni model (gemini-omni-flash-preview) in the global region.
+
+    Saves the video artifact in the Playground's Artifacts panel via tool_context and uploads the bytes directly to a public Cloud Storage bucket without local file writing.
+
+    Args:
+        item_description: Description of the Databricks item or workload to visualize (e.g. 'Cluster auto-scaling', 'Photon engine query acceleration', 'Idle worker node termination').
+        tool_context: ADK ToolContext injected automatically during tool execution.
+
+    Returns:
+        The public HTTPS URL of the uploaded video in Cloud Storage (https://storage.googleapis.com/<bucket>/<object>).
+    """
+    import base64
+    import datetime
+    import google.auth
+    import google.auth.transport.requests
+    import requests
+    from google.cloud import storage
+
+    prompt = f"A high-tech 3D motion graphic visualization of Databricks operations: {item_description}. Professional, smooth animation."
+
+    credentials, project = google.auth.default()
+    auth_req = google.auth.transport.requests.Request()
+    credentials.refresh(auth_req)
+
+    url = f"https://aiplatform.googleapis.com/v1beta1/projects/{FIRESTORE_PROJECT}/locations/global/interactions"
+    headers = {
+        "Authorization": f"Bearer {credentials.token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    payload = {
+        "model": "gemini-omni-flash-preview",
+        "input": [{"type": "text", "text": prompt}],
+        "generation_config": {
+            "video_config": {
+                "task": "text_to_video"
+            }
+        }
+    }
+
+    response = requests.post(url, json=payload, headers=headers, timeout=120)
+    response.raise_for_status()
+    res_data = response.json()
+
+    video_bytes = None
+    for step in res_data.get("steps", []):
+        if "content" in step:
+            for content in step["content"]:
+                if content.get("data"):
+                    video_bytes = base64.b64decode(content["data"])
+                    break
+                elif content.get("bytes_base64"):
+                    video_bytes = base64.b64decode(content["bytes_base64"])
+                    break
+
+    if not video_bytes:
+        raise RuntimeError("No video bytes returned from gemini-omni-flash-preview model.")
+
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"databricks_video_{timestamp}.mp4"
+
+    # 1. Save artifact to Playground via tool_context if provided
+    if tool_context and hasattr(tool_context, "save_artifact"):
+        artifact_part = types.Part.from_bytes(data=video_bytes, mime_type="video/mp4")
+        try:
+            await tool_context.save_artifact(
+                filename=filename,
+                artifact=artifact_part,
+                custom_metadata={
+                    "item_description": item_description,
+                    "model": "gemini-omni-flash-preview",
+                },
+            )
+        except Exception as err:
+            print(f"Warning: Could not save artifact to tool_context: {err}")
+
+    # 2. Upload video bytes directly to public Cloud Storage bucket (no local file writing)
+    storage_client = storage.Client(project=FIRESTORE_PROJECT)
+    bucket = storage_client.bucket(GCS_BUCKET_NAME)
+    blob = bucket.blob(filename)
+    blob.upload_from_string(video_bytes, content_type="video/mp4")
+
+    return f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/{filename}"
+
+
 async def generate_memories_callback(callback_context: CallbackContext):
     try:
         await callback_context.add_session_to_memory()
@@ -1134,7 +1223,8 @@ root_agent = Agent(
         "remediating policy creation failures ('Not authorized to use cluster policy', 'Instance type not allowed', 'Single-user cluster required'), "
         "running unified workload and scaling efficiency analyses (deriving Workload Code Inefficiencies vs Compute Capacity Bottlenecks, horizontal/vertical scaling, time-of-day autoscale bounds), "
         "predicting Photon Engine acceleration speedups (13.3 LTS Photon), evaluating Serverless Compute migrations, auditing Cost Center budget guardrails & quotas, "
-        "auditing Spot Interruption Risk & Tag Governance, detecting cost anomalies and idle clusters using System Tables telemetry "
+        "auditing Spot Interruption Risk & Tag Governance, generating short 3D domain motion videos with Google's Omni model (gemini-omni-flash-preview), "
+        "detecting cost anomalies and idle clusters using System Tables telemetry "
         "(system.billing.list_prices, system.query.history, system.lakeflow.jobs, system.compute.clusters, system.compute.warehouses), "
         "always outputting confidence-scored recommendations and concise executive summaries "
         "(e.g., 'This job violates HIPAA policy because Single User Access Mode is required. This cluster is oversized by 8x. Photon should be enabled. Expected annual savings: 62%'), "
@@ -1164,6 +1254,7 @@ root_agent = Agent(
         # Module 4: Compute Modernization & Acceleration
         predict_photon_acceleration_and_speedup,
         evaluate_serverless_compute_migration,
+        generate_domain_video_preview,
         # Module 5: Financial Dashboards & Action Audit Trail
         get_ops_dashboard,
         calculate_cluster_resizing_savings,
